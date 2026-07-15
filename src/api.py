@@ -2,8 +2,9 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from src import config
-from src.retrieve.vector import vector_search
 from src.answer.generate import answer
+from src.retrieve.hybrid import hybrid_search
+from src.retrieve.rerank import rerank
 
 app = FastAPI(title="FilingSage")
 
@@ -14,8 +15,8 @@ class AskRequest(BaseModel):
 
 @app.post("/ask")
 def ask(req: AskRequest):
-    # Phase 3: pure vector retrieval. Phase 4: swap in hybrid.search().
-    chunks = vector_search(req.question, top_k=config.TOP_K)
+    # Phase 4: hybrid retrieval (BM25 + vector, RRF) + cross-encoder reranking
+    chunks = rerank(req.question, hybrid_search(req.question, top_k=30), top_k=config.TOP_K)
     if not chunks:
         return {"answer": "No documents indexed yet.", "sources": []}
     return {

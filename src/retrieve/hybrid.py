@@ -1,13 +1,16 @@
-"""Phase 4 TODO: merge vector + BM25 results with Reciprocal Rank Fusion, then rerank.
+"""Hybrid retrieval: vector + BM25 fused with Reciprocal Rank Fusion.
+RRF score = sum over rankings of 1/(K + rank). Rank-based, so the two
+systems' incomparable score scales don't matter."""
+from src.retrieve.vector import vector_search
+from src.retrieve.bm25 import bm25_search
 
-RRF skeleton:
+RRF_K = 60
 
-def rrf(result_lists, k=60):
-    scores = {}
-    for results in result_lists:            # each: list of chunk ids in rank order
-        for rank, chunk_id in enumerate(results):
-            scores[chunk_id] = scores.get(chunk_id, 0) + 1 / (k + rank + 1)
-    return sorted(scores, key=scores.get, reverse=True)
-
-Pipeline: vector_search(q, 25) + bm25_search(q, 25) -> rrf -> top 25 -> rerank.rerank(q, top25) -> top 8.
-"""
+def hybrid_search(question: str, top_k: int = 20, fetch_k: int = 30) -> list[dict]:
+    fused: dict = {}
+    for results in (vector_search(question, fetch_k), bm25_search(question, fetch_k)):
+        for rank, chunk in enumerate(results, start=1):
+            entry = fused.setdefault(chunk["id"], {**chunk, "score": 0.0})
+            entry["score"] += 1.0 / (RRF_K + rank)
+    ranked = sorted(fused.values(), key=lambda c: c["score"], reverse=True)
+    return ranked[:top_k]
