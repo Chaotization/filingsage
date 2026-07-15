@@ -1,149 +1,143 @@
-<<<<<<< HEAD
-# FilingSage — Hybrid RAG Research Assistant over SEC Filings
+# FilingSage
 
-Ask natural-language questions over SEC 10-K filings and get citation-grounded answers.
+Ask questions about SEC filings in plain English, get answers with citations.
 
-Pipeline: EDGAR ingestion → section parsing → chunking → local embeddings (sentence-transformers)
-→ pgvector semantic search → grounded generation via the OpenAI API.
+FilingSage is a Retrieval-Augmented Generation (RAG) pipeline that ingests 10-K filings from SEC EDGAR, chunks and embeds them into PostgreSQL with pgvector, and answers natural-language questions through a FastAPI service backed by OpenAI.
 
-Phases 4–6 (hybrid BM25 + reranking, agentic query decomposition, eval harness) have stubs in place.
+## Example
 
----
+```
+$ python scripts/ask.py "What are Apple's main risk factors?"
 
-## Phase 0 — Setup (do this first)
+ANSWER:
+Apple's main risk factors include adverse economic conditions, geopolitical
+and trade disruptions (tariffs, export controls), supply-chain dependence on
+outsourcing partners and single-source components, intense competition and
+rapid technological change, ...
 
-Works on Windows, macOS, and Linux. Windows commands below assume **PowerShell**.
+SOURCES:
+  - AAPL | Item 1A. Risk Factors (score 0.598)
+  - AAPL | Item 1A. Risk Factors (score 0.567)
+  - AAPL | Item 1. Business      (score 0.553)
+```
 
-1. Install:
-   - Python 3.10+ — on Windows, from python.org; check "Add python.exe to PATH" during install
-   - **Docker Desktop** — on Windows it requires the WSL 2 backend (the installer sets this up;
-     if prompted, run `wsl --install` in an admin PowerShell and reboot)
+## Architecture
 
-2. Start Postgres with pgvector (same on all platforms):
-   ```
-   docker compose up -d
-   ```
+```
+SEC EDGAR ──▶ Ingest ──▶ Section-aware chunking ──▶ Embeddings ──▶ pgvector (Postgres 16)
+                                                    (MiniLM-L6)          │
+                                                                         ▼
+User question ──▶ FastAPI /ask ──▶ Vector similarity search ──▶ Top-k chunks
+                                                                         │
+                                                                         ▼
+                                                     OpenAI chat completion ──▶ Answer + sources
+```
 
-3. Create a virtualenv and install dependencies:
+**Stack:** Python 3.13 · FastAPI · PostgreSQL 16 + pgvector · sentence-transformers (`all-MiniLM-L6-v2`) · OpenAI API · Docker Compose
 
-   **Windows (PowerShell):**
-   ```powershell
-   python -m venv venv
-   .\venv\Scripts\Activate.ps1
-   pip install -r requirements.txt
-   ```
-   If activation is blocked by execution policy, run once:
-   `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+## Setup
 
-   **macOS/Linux:**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+### Prerequisites
 
-   Note: the first install pulls PyTorch (CPU) for sentence-transformers — it's large
-   (~200MB+); let it finish.
+- Python 3.11+
+- Docker Desktop
+- An OpenAI API key ([platform.openai.com](https://platform.openai.com) — note: API credits are separate from ChatGPT Plus)
 
-4. Copy `.env.example` to `.env` and fill in:
-   - `OPENAI_API_KEY` — from https://platform.openai.com (API keys page; add ~$5 billing credit)
-   - `SEC_USER_AGENT` — SEC requires a contact string, e.g. "Chao Zheng czheng1735@gmail.com"
-
-   Windows copy command: `copy .env.example .env`   (macOS/Linux: `cp .env.example .env`)
-
-5. Initialize the database schema:
-   ```
-   python scripts/init_db.py
-   ```
-
-## Phase 1 — Ingest filings
-
-Download and parse 10-Ks for the tickers in `scripts/run_ingest.py` (start with ~10, scale later):
+### 1. Clone and configure
 
 ```bash
-python scripts/run_ingest.py
+git clone https://github.com/Chaotization/filingsage.git
+cd filingsage
+cp .env.example .env   # then edit .env with your values
 ```
 
-This downloads each company's latest 10-K from EDGAR, strips HTML, splits it into
-Items (1, 1A, 7, 7A, 8...), and stores sections in Postgres.
+`.env` contents:
 
-## Phase 2 — Chunk + embed
+```
+OPENAI_API_KEY=sk-...
+SEC_USER_AGENT=Your Name your@email.com   # required by SEC EDGAR
+DATABASE_URL=postgresql://filingsage:dev@localhost:5433/filingsage
+EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+CHAT_MODEL=gpt-5-mini
+```
+
+### 2. Start the database
 
 ```bash
-python scripts/run_embed.py
+docker compose up -d
+docker exec filingsage-db-1 psql -U filingsage -d filingsage -c "CREATE EXTENSION IF NOT EXISTS vector;"
 ```
 
-Splits sections into ~500-token chunks with overlap, embeds them locally with
-sentence-transformers (all-MiniLM-L6-v2, 384-dim, CPU-friendly), and writes vectors to pgvector.
-First run downloads the model (~90MB). Embedding is the slow step — let it run.
+### 3. Install dependencies
 
-## Phase 3 — Ask questions
+```bash
+python -m venv venv
+# Windows (PowerShell):
+.\venv\Scripts\Activate.ps1
+# macOS/Linux:
+source venv/bin/activate
 
-Start the API (all platforms):
+pip install -r requirements.txt
 ```
+
+### 4. Build the index
+
+```bash
+python scripts/init_db.py      # create tables
+python scripts/run_ingest.py   # download filings from SEC EDGAR
+python scripts/run_embed.py    # chunk + embed into pgvector
+```
+
+### 5. Run
+
+```bash
+# Terminal 1 — API server
 uvicorn src.api:app --reload
+
+# Terminal 2 — ask questions
+python scripts/ask.py "Compare Apple and Nvidia's supply chain risks"
 ```
 
-Ask a question from a second terminal (cross-platform — avoids curl quoting issues on Windows):
-```
-python scripts/ask.py "What are the main risk factors Apple discusses?"
-```
+Interactive API docs available at http://localhost:8000/docs.
 
-You get an answer grounded in retrieved chunks with citations, or a refusal when
-the context is insufficient (try asking about a company you did not ingest).
-
-## Phase 4 — Hybrid retrieval (your next build step)
-
-Implement `src/retrieve/bm25.py` and merge with vector results using Reciprocal Rank Fusion
-in `src/retrieve/hybrid.py` (skeleton provided), then add cross-encoder reranking in
-`src/retrieve/rerank.py`. Why: embeddings miss exact terms (tickers, dollar figures);
-BM25 catches them; the cross-encoder re-scores a shortlist far more accurately.
-
-## Phase 5 — Agentic query decomposition
-
-Implement `src/answer/decompose.py`: one model call classifies the question, splits
-multi-hop questions ("compare X and Y risk factors") into sub-queries, runs each through
-retrieval, then synthesizes a final cited answer.
-
-## Phase 6 — Evaluation harness
-
-Fill `src/eval/questions.json` with 25–40 Q/A pairs from your corpus, then build
-`src/eval/harness.py` to score faithfulness and context precision with an LLM-as-judge
-call. Use the scores to tune chunk size, retrieval depth, and reranking.
-
----
-
-## Repo layout
+## Project structure
 
 ```
 filingsage/
-├── docker-compose.yml        # Postgres + pgvector
+├── docker-compose.yml      # Postgres 16 + pgvector
 ├── requirements.txt
-├── .env.example
 ├── scripts/
-│   ├── init_db.py            # create tables + indexes
-│   ├── run_ingest.py         # Phase 1: download + parse filings
-│   └── run_embed.py          # Phase 2: chunk + embed
+│   ├── init_db.py          # schema creation
+│   ├── run_ingest.py       # SEC EDGAR download
+│   ├── run_embed.py        # chunking + embedding
+│   └── ask.py              # CLI test client
 └── src/
-    ├── config.py
-    ├── db.py
-    ├── api.py                # FastAPI /ask endpoint
-    ├── ingest/
-    │   ├── download.py       # EDGAR client
-    │   ├── parse.py          # HTML → sections
-    │   └── chunk.py
-    ├── retrieve/
-    │   ├── vector.py         # pgvector search (working)
-    │   ├── bm25.py           # Phase 4 stub
-    │   ├── hybrid.py         # Phase 4 stub (RRF skeleton)
-    │   └── rerank.py         # Phase 4 stub
-    ├── answer/
-    │   ├── generate.py       # OpenAI API grounded answer (working)
-    │   └── decompose.py      # Phase 5 stub
-    └── eval/
-        ├── questions.json    # Phase 6: your test set
-        └── harness.py        # Phase 6 stub
+    ├── api.py              # FastAPI app (/ask endpoint)
+    ├── config.py            # env-driven configuration
+    ├── db.py               # connection + schema
+    ├── retrieve/           # vector search
+    └── answer/             # prompt assembly + OpenAI generation
 ```
-=======
-# filingsage
->>>>>>> b3a35c7c5cd4d241be94856344b7cd3a617c54b0
+
+## Implementation notes & gotchas
+
+Real issues hit while building this, kept here for anyone reproducing the setup:
+
+- **Port 5432 conflicts.** If a native PostgreSQL is installed on the host, it silently intercepts connections meant for the Docker container, producing misleading `password authentication failed` errors. This project maps the container to **5433** to avoid the collision.
+- **pgvector must be enabled per database.** The `pgvector/pgvector` image ships the extension but does not activate it — `CREATE EXTENSION vector` is required once per database (and again after `docker compose down -v`).
+- **psycopg2 can't adapt `numpy.float32`.** Query vectors must be passed as numpy arrays to a connection registered with `pgvector.psycopg2.register_vector` — converting them to Python lists first breaks adaptation.
+- **`max_tokens` is deprecated on newer OpenAI models.** Use `max_completion_tokens` in chat completion calls.
+- **SEC EDGAR requires a User-Agent** identifying you (name + email) or requests get throttled/blocked.
+
+## Roadmap
+
+- [ ] Ticker-aware filtering (prevent cross-company chunks bleeding into answers)
+- [ ] Hybrid retrieval: BM25 + vector scores with reciprocal rank fusion
+- [ ] Cross-encoder reranking of top candidates
+- [ ] Retrieval evaluation harness (recall@k over a gold question set)
+- [ ] Multi-year filings and change-over-time questions
+- [ ] Streaming responses (SSE)
+
+## License
+
+MIT
